@@ -13,3 +13,8 @@
 /infra/nginx-env/var/
 /infra/nginx-env/stands.d/*
 !/infra/nginx-env/stands.d/.gitkeep
+
+# Служебный мусор
+__pycache__/
+*.pyc
+.DS_Store
