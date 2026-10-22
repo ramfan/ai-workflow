@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""Управление прокси-окружением стендов: nginx на одном внешнем порту + панель.
+
+Реестр стендов: stands.d/<имя>.json (один файл на стенд). Из него генерируются
+конфиг nginx и данные панели в var/. Руками var/ не правится.
+
+Команды: up, down, reload, status, add, rm, stop, free-port, api. Подробнее: README.md.
+"""
+
+import argparse
+import datetime
+import fcntl
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONF = os.path.join(ROOT, "conf")
+STANDS = os.path.join(ROOT, "stands.d")
+PANEL = os.path.join(ROOT, "panel")
+VAR = os.path.join(ROOT, "var")
+NGINX_ROOT = os.path.join(VAR, "nginx")
+NGINX_BIN = os.path.join(NGINX_ROOT, "usr", "sbin", "nginx")
+MIME_TYPES = os.path.join(NGINX_ROOT, "etc", "nginx", "mime.types")
+PID_FILE = os.path.join(VAR, "nginx.pid")
+GEN_CONF = os.path.join(VAR, "nginx.conf")
+GEN_ROUTES = os.path.join(VAR, "routes.conf")
+GEN_STANDS = os.path.join(VAR, "stands.json")
+LOCK_FILE = os.path.join(VAR, ".lock")
+API_PID_FILE = os.path.join(VAR, "api.pid")
+API_LOG = os.path.join(VAR, "logs", "api.log")
+DEFAULT_CONTROL_PORT = 10090
+# Сколько ждать завершения процессов стенда после SIGTERM, затем SIGKILL.
+STOP_TIMEOUT = 15
+# Процессы, которые панель никогда не останавливает. Дополняется protected_markers в settings.json.
+PROTECTED_MARKERS = ("nginx", "docker-proxy", "envctl", "opencode", "supervisord")
+# Родительский процесс с такой строкой в команде останавливается вместе со стендом (wrapper_markers в settings.json).
+WRAPPER_MARKERS = ()
+# Имена стендов, которые нельзя использовать (reserved_names в settings.json), например базовый путь приложения.
+RESERVED_NAMES = ()
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+
+
+def load_settings():
+    global WRAPPER_MARKERS, RESERVED_NAMES, PROTECTED_MARKERS
+    with open(os.path.join(CONF, "settings.json"), encoding="utf-8") as f:
+        settings = json.load(f)
+    WRAPPER_MARKERS = tuple(settings.get("wrapper_markers", []))
+    RESERVED_NAMES = tuple(settings.get("reserved_names", []))
+    PROTECTED_MARKERS = PROTECTED_MARKERS + tuple(settings.get("protected_markers", []))
+    return settings
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M %z")
+
+
+class EnvError(Exception):
+    pass
+
+
+def die(msg):
+    raise EnvError(msg)
+
+
+def control_port(settings):
+    return settings.get("control_port", DEFAULT_CONTROL_PORT)
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(VAR, exist_ok=True)
+        self.f = open(LOCK_FILE, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---------- реестр ----------
+
+def validate_name(name):
+    if not NAME_RE.match(name):
+        die(f"имя '{name}': только a-z, 0-9 и '-', начинается с буквы или цифры, до 40 символов")
+    if name in RESERVED_NAMES:
+        die(f"имя '{name}' зарезервировано")
+
+
+def read_stands():
+    stands = []
+    if not os.path.isdir(STANDS):
+        return stands
+    for fn in sorted(os.listdir(STANDS)):
+        if not fn.endswith(".json"):
+            continue
+        name = fn[:-5]
+        path = os.path.join(STANDS, fn)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"предупреждение: {path} пропущен: {e}", file=sys.stderr)
+            continue
+        if not NAME_RE.match(name) or name in RESERVED_NAMES:
+            print(f"предупреждение: {path} пропущен: недопустимое имя", file=sys.stderr)
+            continue
+        port = data.get("port")
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            print(f"предупреждение: {path} пропущен: нет корректного port", file=sys.stderr)
+            continue
+        data["name"] = name
+        data.setdefault("strip_prefix", True)
+        data.setdefault("landing", "/")
+        stands.append(data)
+    return stands
+
+
+def port_open(port, host="127.0.0.1", timeout=0.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def read_stand(name):
+    for s in read_stands():
+        if s["name"] == name:
+            return s
+    die(f"стенда '{name}' нет")
+
+
+# ---------- процессы стенда ----------
+
+def listening_inodes(port):
+    inodes = set()
+    for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(fn) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    local, state, inode = parts[1], parts[3], parts[9]
+                    # 0A = LISTEN
+                    if state == "0A" and int(local.rsplit(":", 1)[1], 16) == port and inode != "0":
+                        inodes.add(inode)
+        except OSError:
+            pass
+    return inodes
+
+
+def all_pids():
+    return [int(d) for d in os.listdir("/proc") if d.isdigit()]
+
+
+def listening_pids(port):
+    inodes = listening_inodes(port)
+    if not inodes:
+        return []
+    wanted = {f"socket:[{i}]" for i in inodes}
+    found = []
+    for pid in all_pids():
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(os.path.join(fd_dir, fd)) in wanted:
+                        found.append(pid)
+                        break
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return found
+
+
+def proc_cmd(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+
+
+def proc_ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        # Имя процесса в скобках может содержать пробелы: поля считаем после ')'.
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def pid_alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            # Зомби уже не держит ресурсы, считаем завершённым.
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def descendants(pids):
+    children = {}
+    for pid in all_pids():
+        children.setdefault(proc_ppid(pid), []).append(pid)
+    result, queue = [], list(pids)
+    while queue:
+        for child in children.get(queue.pop(), []):
+            if child not in result and child not in pids:
+                result.append(child)
+                queue.append(child)
+    return result
+
+
+def is_protected(pid, cmd):
+    # Сверяем имя исполняемого файла и скрипта, а не всю строку: в аргументах
+    # стендов встречаются пути вроде /tmp/opencode/...
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        argv = cmd.split()
+    names = {os.path.basename(a) for a in argv[:2]}
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            names.add(f.read().strip())
+    except OSError:
+        pass
+    return any(m in n for n in names for m in PROTECTED_MARKERS)
+
+
+def stand_processes(stand, settings):
+    """Процессы, которые останавливаются вместе со стендом: слушающий порт процесс,
+    его обёртка из wrapper_markers и их потомки."""
+    port = stand["port"]
+    if port in (settings["listen_port"], control_port(settings)):
+        die(f"порт {port} принадлежит окружению прокси, его процесс не останавливается")
+    listeners = listening_pids(port)
+    targets = list(listeners)
+    for pid in listeners:
+        ppid = proc_ppid(pid)
+        if ppid and ppid > 1 and ppid not in targets and any(m in (proc_cmd(ppid) or "") for m in WRAPPER_MARKERS):
+            targets.append(ppid)
+    targets += descendants(targets)
+    own = {os.getpid(), os.getppid(), 1}
+    procs = []
+    for pid in targets:
+        cmd = proc_cmd(pid)
+        if cmd is None:
+            continue
+        if pid in own or is_protected(pid, cmd):
+            die(f"на порту {port} служебный процесс (pid {pid}: {cmd[:120]}), остановка запрещена")
+        procs.append({"pid": pid, "cmd": cmd, "rss_mb": proc_rss_mb(pid), "listens": pid in listeners})
+    return procs
+
+
+def stop_stand(name, settings, log=print):
+    stand = read_stand(name)
+    port = stand["port"]
+    procs = stand_processes(stand, settings)
+    if not procs:
+        return {"name": name, "port": port, "processes": [], "result": "процесс уже не работал"}
+    pids = [p["pid"] for p in procs]
+    log(f"стенд '{name}', порт {port}: SIGTERM -> {', '.join(map(str, pids))}")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + STOP_TIMEOUT
+    while time.time() < deadline:
+        if not any(pid_alive(p) for p in pids) and not listening_inodes(port):
+            break
+        time.sleep(0.3)
+    killed = [p for p in pids if pid_alive(p)]
+    if killed:
+        log(f"стенд '{name}': за {STOP_TIMEOUT} с не завершились, SIGKILL -> {', '.join(map(str, killed))}")
+        for pid in killed:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for _ in range(50):
+            if not any(pid_alive(p) for p in killed):
+                break
+            time.sleep(0.1)
+    if listening_inodes(port):
+        die(f"порт {port} всё ещё занят после остановки. Проверь вручную")
+    return {
+        "name": name, "port": port, "processes": procs, "sigkill": killed,
+        "freed_mb": sum(p["rss_mb"] for p in procs),
+        "result": "остановлен" + (" (SIGKILL)" if killed else ""),
+    }
+
+
+# ---------- генерация ----------
+
+def render_routes(stands):
+    out = ["# Сгенерировано bin/envctl из stands.d/*.json. Не править руками.", ""]
+    for s in stands:
+        name, port = s["name"], s["port"]
+        upstream = f"http://127.0.0.1:{port}"
+        out.append(f"# {name}: {s.get('title', '')}".rstrip())
+        out.append(f"location = /{name} {{ return 302 /{name}/; }}")
+        out.append(f"location /{name}/ {{")
+        out.append(f"    include {CONF}/proxy_headers.conf;")
+        out.append(f"    proxy_set_header X-Forwarded-Prefix /{name};")
+        # Абсолютные редиректы на себя (внешний хост или localhost) превращаем в
+        # относительные, чужие (SSO и т. п.) не трогаем.
+        local = r"~^https?://(localhost|127\.0\.0\.1)(:\d+)?/(.*)$"
+        if s["strip_prefix"]:
+            out.append(f"    proxy_pass {upstream}/;")
+            out.append(f"    proxy_redirect http://$http_host/ /{name}/;")
+            out.append(f"    proxy_redirect https://$http_host/ /{name}/;")
+            out.append(f"    proxy_redirect {local} /{name}/$3;")
+            out.append(f"    proxy_redirect ~^/(.*)$ /{name}/$1;")
+            out.append(f"    proxy_cookie_path / /{name}/;")
+        else:
+            out.append(f"    proxy_pass {upstream};")
+            out.append("    proxy_redirect http://$http_host/ /;")
+            out.append("    proxy_redirect https://$http_host/ /;")
+            out.append(f"    proxy_redirect {local} /$3;")
+        out.append("}")
+        out.append(f"location = /_env/ping/{name} {{")
+        out.append("    access_log off;")
+        out.append("    proxy_method HEAD;")
+        out.append("    proxy_pass_request_body off;")
+        out.append(f"    include {CONF}/proxy_headers.conf;")
+        out.append("    proxy_set_header Content-Length \"\";")
+        out.append("    proxy_connect_timeout 2s;")
+        out.append("    proxy_read_timeout 5s;")
+        out.append(f"    proxy_pass {upstream}{'/' if s['strip_prefix'] else '/' + name + '/'};")
+        out.append("}")
+        out.append("")
+    return "\n".join(out)
+
+
+def render_conf(settings):
+    with open(os.path.join(CONF, "nginx.conf.tmpl"), encoding="utf-8") as f:
+        tmpl = f.read()
+    values = {
+        "@LISTEN_PORT@": str(settings["listen_port"]),
+        "@VAR@": VAR,
+        "@CONF@": CONF,
+        "@PANEL@": PANEL,
+        "@MIME_TYPES@": MIME_TYPES,
+        "@ROUTES@": GEN_ROUTES,
+        "@STANDS_JSON@": GEN_STANDS,
+        "@CONTROL_PORT@": str(control_port(settings)),
+    }
+    for k, v in values.items():
+        tmpl = tmpl.replace(k, v)
+    return tmpl
+
+
+def write_atomic(path, content):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def generate(settings):
+    stands = read_stands()
+    for d in ("temp", "logs"):
+        os.makedirs(os.path.join(VAR, d), exist_ok=True)
+    write_atomic(GEN_ROUTES, render_routes(stands))
+    write_atomic(GEN_CONF, render_conf(settings))
+    public = []
+    for s in stands:
+        item = {k: v for k, v in s.items() if k in (
+            "name", "port", "title", "task", "description", "session", "owner",
+            "landing", "registered", "kind")}
+        item["url"] = f"/{s['name']}{s['landing'] if s['landing'].startswith('/') else '/' + s['landing']}"
+        public.append(item)
+    write_atomic(GEN_STANDS, json.dumps({
+        "generated": now(),
+        "listen_port": settings["listen_port"],
+        "direct_ports": settings.get("direct_ports", []),
+        "stands": public,
+    }, ensure_ascii=False, indent=2))
+    return stands
+
+
+# ---------- nginx ----------
+
+def ensure_nginx():
+    if os.path.exists(NGINX_BIN):
+        return
+    print("nginx не найден, скачиваю пакеты Debian в var/nginx ...")
+    dl = os.path.join(VAR, "dl")
+    shutil.rmtree(dl, ignore_errors=True)
+    os.makedirs(dl)
+    r = subprocess.run(["apt-get", "download", "nginx", "nginx-common"], cwd=dl,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    debs = [f for f in os.listdir(dl) if f.endswith(".deb")]
+    if r.returncode != 0 or len(debs) < 2:
+        print(r.stdout, file=sys.stderr)
+        die("не удалось скачать nginx через apt-get download (попробуй apt-get update)")
+    for deb in debs:
+        subprocess.run(["dpkg", "-x", os.path.join(dl, deb), NGINX_ROOT], check=True)
+    shutil.rmtree(dl, ignore_errors=True)
+    if not os.path.exists(NGINX_BIN):
+        die(f"после распаковки нет {NGINX_BIN}")
+
+
+def nginx_cmd(*extra):
+    return [NGINX_BIN, "-p", VAR + "/", "-c", GEN_CONF, "-e", os.path.join(VAR, "logs", "error.log"), *extra]
+
+
+def nginx_pid():
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"nginx" not in f.read():
+                return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def nginx_test():
+    r = subprocess.run(nginx_cmd("-t", "-q"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        print(r.stdout, file=sys.stderr)
+        return False
+    return True
+
+
+def apply(settings, start_if_down=True):
+    """Сгенерировать конфиг, проверить и применить. Возвращает True, если nginx работает."""
+    ensure_nginx()
+    prev = {}
+    for p in (GEN_CONF, GEN_ROUTES, GEN_STANDS):
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                prev[p] = f.read()
+    generate(settings)
+    if not nginx_test():
+        for p, content in prev.items():
+            write_atomic(p, content)
+        die("nginx -t не прошёл, прежний конфиг восстановлен. Проверь stands.d/")
+    pid = nginx_pid()
+    if pid:
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.3)
+        return True
+    if not start_if_down:
+        return False
+    port = settings["listen_port"]
+    if port_open(port):
+        die(f"порт {port} занят другим процессом. Освободи его и повтори 'envctl up'")
+    r = subprocess.run(nginx_cmd(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        print(r.stdout, file=sys.stderr)
+        die("nginx не запустился, см. var/logs/error.log")
+    for _ in range(20):
+        if port_open(port):
+            return True
+        time.sleep(0.1)
+    die("nginx запущен, но порт не слушается, см. var/logs/error.log")
+
+
+# ---------- сервис команд панели ----------
+
+def api_pid():
+    try:
+        with open(API_PID_FILE) as f:
+            pid = int(f.read().strip())
+        if pid_alive(pid) and "envctl" in (proc_cmd(pid) or ""):
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def api_start(settings):
+    pid = api_pid()
+    if pid:
+        return pid
+    port = control_port(settings)
+    if port_open(port):
+        die(f"порт {port} (control_port) занят другим процессом")
+    os.makedirs(os.path.dirname(API_LOG), exist_ok=True)
+    with open(API_LOG, "a") as log:
+        p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "api"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True, cwd=ROOT)
+    for _ in range(30):
+        if port_open(port):
+            return p.pid
+        time.sleep(0.1)
+    die("сервис команд панели не запустился, см. var/logs/api.log")
+
+
+def api_stop():
+    pid = api_pid()
+    if not pid:
+        return False
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    return True
+
+
+class ApiHandler(http.server.BaseHTTPRequestHandler):
+    settings = None
+    route = re.compile(r"^/_env/api/stands/([a-z0-9-]+)/(processes|stop|rm)$")
+
+    def log_message(self, fmt, *args):
+        print(f"{now()} {self.address_string()} {fmt % args}", flush=True)
+
+    def reply(self, code, body):
+        data = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_cmd(self, method):
+        m = self.route.match(self.path.split("?", 1)[0])
+        if not m:
+            return self.reply(404, {"error": "нет такого метода"})
+        name, action = m.groups()
+        if (action == "processes") != (method == "GET"):
+            return self.reply(405, {"error": "неверный HTTP-метод"})
+        # Защита от отправки формы с чужой страницы: такой заголовок браузер
+        # без CORS не добавит.
+        if method == "POST" and self.headers.get("X-Env-Panel") != "1":
+            return self.reply(403, {"error": "нет заголовка X-Env-Panel"})
+        try:
+            validate_name(name)
+            settings = self.settings
+            if action == "processes":
+                stand = read_stand(name)
+                return self.reply(200, {"name": name, "port": stand["port"],
+                                        "processes": stand_processes(stand, settings)})
+            if action == "stop":
+                res = stop_stand(name, settings)
+                print(f"{now()} stop {name}: {res['result']}", flush=True)
+                return self.reply(200, res)
+            stand = read_stand(name)
+            if listening_inodes(stand["port"]):
+                die(f"стенд '{name}' ещё работает на порту {stand['port']}. Сначала останови его")
+            remove_stand(name, settings)
+            print(f"{now()} rm {name}", flush=True)
+            return self.reply(200, {"name": name, "result": "удалён из прокси"})
+        except EnvError as e:
+            return self.reply(409, {"error": str(e)})
+        except SystemExit:
+            return self.reply(500, {"error": "внутренняя ошибка, см. var/logs/api.log"})
+
+    def do_GET(self):
+        self.handle_cmd("GET")
+
+    def do_POST(self):
+        self.handle_cmd("POST")
+
+
+def cmd_api(args, settings):
+    port = control_port(settings)
+    ApiHandler.settings = settings
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), ApiHandler)
+    write_atomic(API_PID_FILE, str(os.getpid()))
+    def on_term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
+    print(f"{now()} сервис команд панели слушает 127.0.0.1:{port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        try:
+            os.remove(API_PID_FILE)
+        except OSError:
+            pass
+
+
+# ---------- команды ----------
+
+def cmd_up(args, settings):
+    with Lock():
+        apply(settings)
+    api_start(settings)
+    print(f"готово: панель http://localhost:{settings['listen_port']}/_env/")
+
+
+def cmd_reload(args, settings):
+    with Lock():
+        running = apply(settings, start_if_down=False)
+    print("конфиг применён" if running else "конфиг сгенерирован, nginx не запущен (envctl up)")
+
+
+def cmd_down(args, settings):
+    if api_stop():
+        print("сервис команд панели остановлен")
+    with Lock():
+        pid = nginx_pid()
+        if not pid:
+            print("nginx не запущен")
+            return
+        os.kill(pid, signal.SIGQUIT)
+        for _ in range(50):
+            if not nginx_pid():
+                break
+            time.sleep(0.1)
+    print("nginx остановлен")
+
+
+def ping(port, path):
+    if not port_open(port):
+        return "остановлен"
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="HEAD")
+        urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError:
+        pass
+    except Exception:
+        return "не отвечает"
+    return "работает"
+
+
+def cmd_status(args, settings):
+    pid = nginx_pid()
+    port = settings["listen_port"]
+    print(f"nginx: {'работает, pid ' + str(pid) if pid else 'не запущен'}; порт {port}; панель /_env/")
+    apid = api_pid()
+    print(f"сервис команд панели: {'работает, pid ' + str(apid) if apid else 'не запущен (envctl up)'}; "
+          f"порт {control_port(settings)}")
+    stands = read_stands()
+    if not stands:
+        print("стендов нет")
+        return
+    rows = [("имя", "порт", "состояние", "задача", "путь")]
+    for s in stands:
+        path = "/" if s["strip_prefix"] else f"/{s['name']}/"
+        rows.append((s["name"], str(s["port"]), ping(s["port"], path), s.get("task", ""),
+                     f"/{s['name']}{s['landing']}"))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
+
+
+def cmd_add(args, settings):
+    validate_name(args.name)
+    if args.port in (settings["listen_port"],):
+        die(f"порт {args.port} занят самим nginx")
+    landing = args.landing or "/"
+    if not landing.startswith("/"):
+        landing = "/" + landing
+    path = os.path.join(STANDS, f"{args.name}.json")
+    with Lock():
+        for s in read_stands():
+            if s["port"] == args.port and s["name"] != args.name:
+                die(f"порт {args.port} уже зарегистрирован за стендом '{s['name']}'")
+        old = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+            if not args.force and old.get("session") and args.session and old["session"] != args.session:
+                die(f"стенд '{args.name}' зарегистрирован другой сессией ({old['session']}). "
+                    "Выбери другое имя или согласуй с пользователем (--force)")
+        data = {
+            "port": args.port,
+            "title": args.title or old.get("title") or args.name,
+            "task": args.task if args.task is not None else old.get("task", ""),
+            "description": args.desc if args.desc is not None else old.get("description", ""),
+            "session": args.session if args.session is not None else old.get("session", ""),
+            "kind": args.kind if args.kind is not None else old.get("kind", ""),
+            "landing": landing if args.landing is not None else old.get("landing", "/"),
+            "strip_prefix": not args.no_strip,
+            "registered": old.get("registered") or now(),
+            "updated": now(),
+        }
+        os.makedirs(STANDS, exist_ok=True)
+        write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        running = apply(settings, start_if_down=not args.no_start)
+    state = "работает" if port_open(args.port) else "порт пока не слушается"
+    print(f"стенд '{args.name}' -> 127.0.0.1:{args.port} ({state})")
+    print(f"адрес: /{args.name}{data['landing']}" + ("" if running else " (nginx не запущен: envctl up)"))
+
+
+def remove_stand(name, settings):
+    path = os.path.join(STANDS, f"{name}.json")
+    with Lock():
+        if not os.path.exists(path):
+            die(f"стенда '{name}' нет")
+        os.remove(path)
+        apply(settings, start_if_down=False)
+
+
+def cmd_rm(args, settings):
+    validate_name(args.name)
+    remove_stand(args.name, settings)
+    print(f"стенд '{args.name}' удалён из реестра (сам процесс стенда не трогали)")
+
+
+def cmd_stop(args, settings):
+    validate_name(args.name)
+    res = stop_stand(args.name, settings)
+    for p in res["processes"]:
+        print(f"  pid {p['pid']}, {p['rss_mb']} МБ: {p['cmd'][:150]}")
+    print(f"стенд '{args.name}', порт {res['port']}: {res['result']}"
+          + (f", освобождено около {res['freed_mb']} МБ" if res.get("freed_mb") else ""))
+    if args.rm:
+        remove_stand(args.name, settings)
+        print(f"стенд '{args.name}' удалён из реестра")
+
+
+def cmd_free_port(args, settings):
+    lo, hi = settings["stand_port_range"]
+    taken = {s["port"] for s in read_stands()}
+    for p in range(lo, hi + 1):
+        if p not in taken and not port_open(p):
+            print(p)
+            return
+    die(f"нет свободных портов в диапазоне {lo}-{hi}")
+
+
+def main():
+    settings = load_settings()
+    ap = argparse.ArgumentParser(prog="envctl", description="nginx-прокси для стендов и панель")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("up", help="скачать nginx при необходимости, сгенерировать конфиг, запустить или перечитать")
+    sub.add_parser("down", help="остановить nginx")
+    sub.add_parser("reload", help="перегенерировать конфиг из stands.d и перечитать")
+    sub.add_parser("status", help="состояние nginx и стендов")
+    sub.add_parser("free-port", help="свободный порт для нового стенда")
+    a = sub.add_parser("add", help="зарегистрировать или обновить стенд")
+    a.add_argument("name", help="имя = путь /<имя>/")
+    a.add_argument("--port", type=int, required=True)
+    a.add_argument("--title")
+    a.add_argument("--task", help="задача, например <ws>/<задача>")
+    a.add_argument("--desc", help="что это за стенд, ветка, особенности")
+    a.add_argument("--session", help="ID сессии агента")
+    a.add_argument("--kind", help="тип: app, dev-server, backend, другое")
+    a.add_argument("--landing", help="путь после префикса для ссылки в панели, например /app/")
+    a.add_argument("--no-strip", action="store_true", help="не срезать префикс (приложение само живёт под /<имя>/)")
+    a.add_argument("--no-start", action="store_true", help="не запускать nginx, если он остановлен")
+    a.add_argument("--force", action="store_true", help="перезаписать стенд другой сессии")
+    r = sub.add_parser("rm", help="удалить стенд из реестра")
+    r.add_argument("name")
+    s = sub.add_parser("stop", help="остановить процесс стенда (и его обёртку из wrapper_markers)")
+    s.add_argument("name")
+    s.add_argument("--rm", action="store_true", help="после остановки удалить из реестра")
+    sub.add_parser("api", help="сервис команд панели на переднем плане (обычно запускает envctl up)")
+    args = ap.parse_args()
+    try:
+        {
+            "up": cmd_up, "down": cmd_down, "reload": cmd_reload, "status": cmd_status,
+            "add": cmd_add, "rm": cmd_rm, "stop": cmd_stop, "free-port": cmd_free_port,
+            "api": cmd_api,
+        }[args.cmd](args, settings)
+    except EnvError as e:
+        print(f"ошибка: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,47 @@
+# Настройки пространства. Лежит в workspaces/<ws>/ws.yaml. Схема: rules/config.md, раздел 3.
+# В строках можно использовать ${ROOT}, ${TMP_DIR}, ${PROXY_DIR}, ${PROXY_URL} и ${ИМЯ} из vars в env.yaml.
+
+# Имя пространства. Должно совпадать с именем папки workspaces/<ws>.
+name: template
+
+# Одно предложение: что это за проект.
+description: ""
+
+# Где лежит код. Список, минимум один элемент.
+#   path   - путь к папке.
+#   kind   - repo: path сам является git-репозиторием;
+#            repos-dir: внутри path лежат git-репозитории (на любой глубине), каждый - отдельный репозиторий.
+#   access - write: правки разрешены (через worktree задачи);
+#            ask:   правки только после явного разрешения пользователя в текущей задаче;
+#            read:  только чтение.
+sources:
+  - path: ${FRONTEND_CODE}/project
+    kind: repo
+    access: write
+
+# Настройки git по умолчанию для задач этого пространства. Задача может переопределить root_branch.
+git:
+  # Есть ли в репозитории подмодули, которые нужно скачать после создания worktree.
+  submodules: false
+  # Создавать ли ветку задачи в корневом репозитории: true - да; false - корень без ветки (detached), правки только в подмодулях.
+  root_branch: true
+  # Указывать ли ключ задачи (task.yaml -> jira) в сообщениях коммитов.
+  jira_in_commit: true
+
+# Правила пространства: пути относительно папки пространства. Читаются после общих правил $ROOT/rules/.
+rules: []
+
+# Секреты: сервис -> ключ из файла секретов (env.yaml -> secrets_file).
+# Имена сервисов jira, gitlab, stand_login, stand_password понимают общие правила; остальные - по правилам пространства.
+secrets:
+  jira: JIRA_API_TOKEN
+  gitlab: GITLAB_TOKEN
+  stand_login: STAND_LOGIN
+  stand_password: STAND_PASSWORD
+
+# Стенды. Если стенды не нужны - удали раздел или оставь proxy: false.
+stands:
+  # Регистрировать стенды в прокси (infra/nginx-env).
+  proxy: true
+  # Путь после префикса стенда, который открывает пользователь. null - корень.
+  landing: null

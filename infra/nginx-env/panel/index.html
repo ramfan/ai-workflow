@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Стенды</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #fff; --fg: #1d2330; --muted: #6b7385; --border: #dde1e8;
+    --ok: #1f9d55; --warn: #d69e2e; --bad: #d64545; --unk: #a0a7b4; --accent: #2b6cb0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15181e; --card: #1e232b; --fg: #e4e7ec; --muted: #8f97a6; --border: #2f3642;
+      --accent: #63a4ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 24px; padding: 18px 24px 8px; }
+  h1 { font-size: 20px; margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  input[type=search] { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); min-width: 220px; }
+  button { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  main { padding: 8px 24px 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .card.down { opacity: .6; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--unk); }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  .title { font-weight: 600; font-size: 15px; color: var(--accent); text-decoration: none; word-break: break-word; }
+  .title:hover { text-decoration: underline; }
+  .state { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .desc { color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+  .mono { font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .actions { display: flex; gap: 6px; margin-top: 4px; }
+  .actions button { font-size: 12px; padding: 3px 8px; }
+  .actions button.danger { margin-left: auto; color: var(--bad); }
+  .actions button.danger:hover { border-color: var(--bad); }
+  .actions button:disabled { opacity: .5; cursor: wait; }
+  .msg { font-size: 12px; white-space: pre-wrap; }
+  .msg.bad { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  .banner { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--bad); color: var(--bad); display: none; }
+  .empty { color: var(--muted); padding: 30px 0; }
+  footer { padding: 0 24px 24px; color: var(--muted); font-size: 13px; }
+  footer code { font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Стенды контейнера</h1>
+  <span class="meta" id="meta"></span>
+  <div class="toolbar">
+    <input type="search" id="filter" placeholder="Фильтр: имя, задача, описание">
+    <button id="refresh" type="button">Обновить</button>
+  </div>
+</header>
+<main>
+  <div class="banner" id="banner"></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden>Стендов нет. Добавить: <code>bin/envctl add &lt;имя&gt; --port &lt;порт&gt;</code></div>
+</main>
+<footer>
+  Как добавить стенд: подними его на свободном порту (<code>bin/envctl free-port</code>) и зарегистрируй
+  (<code>bin/envctl add &lt;имя&gt; --port &lt;порт&gt; --task &lt;задача&gt;</code>).
+  Инструкция: <code>infra/nginx-env/README.md</code>. Состояние обновляется раз в 10 секунд.
+</footer>
+<script>
+(function () {
+  "use strict";
+  var grid = document.getElementById("grid");
+  var empty = document.getElementById("empty");
+  var banner = document.getElementById("banner");
+  var meta = document.getElementById("meta");
+  var filter = document.getElementById("filter");
+  var data = null;
+  var states = {};
+  var busy = {};
+  var messages = {};
+
+  function api(method, name, action) {
+    var opts = { method: method, cache: "no-store" };
+    if (method === "POST") opts.headers = { "X-Env-Panel": "1" };
+    return fetch("/_env/api/stands/" + encodeURIComponent(name) + "/" + action, opts)
+      .then(function (r) {
+        return r.json().catch(function () { return { error: "HTTP " + r.status }; }).then(function (body) {
+          if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+          return body;
+        });
+      }, function () { throw new Error("сервис команд панели недоступен (bin/envctl up)"); });
+  }
+
+  function stopStand(s) {
+    api("GET", s.name, "processes").then(function (info) {
+      var procs = info.processes;
+      var text = "Остановить стенд " + s.name + " (порт " + s.port + ")?\n\n";
+      if (!procs.length) {
+        text += "Процесса на порту нет.";
+      } else {
+        text += "Будут остановлены процессы:\n" + procs.map(function (p) {
+          return "pid " + p.pid + ", " + p.rss_mb + " МБ: " + p.cmd.slice(0, 90);
+        }).join("\n");
+      }
+      text += "\n\nСопутствующие процессы (ClickHouse, Chromium и др.) не останавливаются. Карточка останется, удалить её можно отдельно.";
+      if (!window.confirm(text)) return;
+      busy[s.name] = "Останавливаю…";
+      delete messages[s.name];
+      render();
+      return api("POST", s.name, "stop").then(function (res) {
+        messages[s.name] = { cls: "ok", text: res.result + (res.freed_mb ? ", освобождено около " + res.freed_mb + " МБ" : "") };
+      });
+    }).catch(function (e) {
+      messages[s.name] = { cls: "bad", text: "Не остановлен: " + e.message };
+    }).then(function () {
+      delete busy[s.name];
+      return load();
+    });
+  }
+
+  function removeStand(s) {
+    if (!window.confirm("Удалить стенд " + s.name + " из прокси и панели?\n\nФайлы стенда не удаляются.")) return;
+    busy[s.name] = "Удаляю…";
+    render();
+    api("POST", s.name, "rm").then(function () {
+      delete messages[s.name];
+    }).catch(function (e) {
+      messages[s.name] = { cls: "bad", text: "Не удалён: " + e.message };
+    }).then(function () {
+      delete busy[s.name];
+      return load();
+    });
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function matches(s, q) {
+    if (!q) return true;
+    var hay = [s.name, s.title, s.task, s.description, s.kind, String(s.port)].join(" ").toLowerCase();
+    return hay.indexOf(q.toLowerCase()) !== -1;
+  }
+
+  function stateView(st) {
+    if (!st) return { cls: "", text: "проверка…" };
+    if (st.code === 0) return { cls: "bad", text: "нет ответа от nginx" };
+    if (st.code === 502 || st.code === 504) return { cls: "bad", text: "остановлен" };
+    if (st.code >= 500) return { cls: "warn", text: "ошибка " + st.code };
+    return { cls: "ok", text: "работает" };
+  }
+
+  function render() {
+    grid.textContent = "";
+    if (!data) return;
+    var q = filter.value.trim();
+    var list = data.stands.filter(function (s) { return matches(s, q); });
+    empty.hidden = data.stands.length !== 0;
+    list.forEach(function (s) {
+      var view = stateView(states[s.name]);
+      var card = el("div", "card" + (view.cls === "bad" ? " down" : ""));
+
+      var head = el("div", "row");
+      head.appendChild(el("span", "dot " + view.cls));
+      var a = el("a", "title", s.title || s.name);
+      a.href = s.url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      head.appendChild(a);
+      head.appendChild(el("span", "state", view.text));
+      card.appendChild(head);
+
+      var tags = el("div", "row");
+      if (s.task) tags.appendChild(el("span", "tag", s.task));
+      if (s.kind) tags.appendChild(el("span", "tag", s.kind));
+      tags.appendChild(el("span", "tag", "порт " + s.port));
+      card.appendChild(tags);
+
+      if (s.description) card.appendChild(el("div", "desc", s.description));
+
+      var abs = location.origin + s.url;
+      card.appendChild(el("div", "mono", abs));
+      var info = [];
+      if (s.registered) info.push("добавлен " + s.registered);
+      if (s.session) info.push("сессия " + s.session);
+      if (info.length) card.appendChild(el("div", "mono", info.join(" · ")));
+
+      var actions = el("div", "actions");
+      var open = el("button", "", "Открыть");
+      open.type = "button";
+      open.addEventListener("click", function () { window.open(s.url, "_blank", "noopener"); });
+      var copy = el("button", "", "Копировать адрес");
+      copy.type = "button";
+      copy.addEventListener("click", function () {
+        var done = function () { copy.textContent = "Скопировано"; setTimeout(function () { copy.textContent = "Копировать адрес"; }, 1500); };
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(abs).then(done, function () { window.prompt("Адрес", abs); });
+        } else {
+          window.prompt("Адрес", abs);
+        }
+      });
+      actions.appendChild(open);
+      actions.appendChild(copy);
+      var stopped = states[s.name] && (states[s.name].code === 502 || states[s.name].code === 504);
+      if (busy[s.name]) {
+        var wait = el("button", "danger", busy[s.name]);
+        wait.type = "button";
+        wait.disabled = true;
+        actions.appendChild(wait);
+      } else if (stopped) {
+        var del = el("button", "danger", "Удалить");
+        del.type = "button";
+        del.title = "Убрать стенд из прокси и панели (bin/envctl rm)";
+        del.addEventListener("click", function () { removeStand(s); });
+        actions.appendChild(del);
+      } else if (states[s.name]) {
+        var stop = el("button", "danger", "Остановить");
+        stop.type = "button";
+        stop.title = "Остановить процесс стенда и освободить ресурсы";
+        stop.addEventListener("click", function () { stopStand(s); });
+        actions.appendChild(stop);
+      }
+      card.appendChild(actions);
+      if (messages[s.name]) card.appendChild(el("div", "msg " + messages[s.name].cls, messages[s.name].text));
+
+      grid.appendChild(card);
+    });
+  }
+
+  function ping(s) {
+    return fetch("/_env/ping/" + encodeURIComponent(s.name), { method: "HEAD", cache: "no-store" })
+      .then(function (r) { states[s.name] = { code: r.status }; })
+      .catch(function () { states[s.name] = { code: 0 }; });
+  }
+
+  function load() {
+    return fetch("/_env/api/stands.json", { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (json) {
+        data = json;
+        banner.style.display = "none";
+        meta.textContent = "стендов: " + json.stands.length + " · реестр обновлён " + json.generated;
+        render();
+        return Promise.all(json.stands.map(ping)).then(render);
+      })
+      .catch(function (e) {
+        banner.textContent = "Не удалось загрузить список стендов (" + e.message + "). Проверь в контейнере: bin/envctl status";
+        banner.style.display = "block";
+      });
+  }
+
+  filter.addEventListener("input", render);
+  document.getElementById("refresh").addEventListener("click", load);
+  load();
+  setInterval(load, 10000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Настройки конкретной машины и секреты
+/env.yaml
+/secrets.yaml
+
+# Пространства и задачи этой копии: код, worktree, вложения
+/workspaces/*
+!/workspaces/.gitkeep
+
+# Учёт ведётся локально
+/registry/WORKTREES.md
+
+# Генерируемые файлы прокси
+/infra/nginx-env/var/
+/infra/nginx-env/stands.d/*
+!/infra/nginx-env/stands.d/.gitkeep

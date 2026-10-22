@@ -1,0 +1,14 @@
+{
+  "listen_port": 10002,
+  "stand_port_range": [10100, 10199],
+  "control_port": 10090,
+  "direct_ports": [
+    {
+      "port": 10001,
+      "note": "Второй внешний порт, без прокси. Не занимать новыми стендами."
+    }
+  ],
+  "wrapper_markers": [],
+  "reserved_names": [],
+  "protected_markers": []
+}

@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Проверка YAML-настроек ai-workflow по схемам из rules/config.md.
+
+Использование: bin/check-config [<ws>]
+Ничего не меняет. Значения секретов не выводит.
+"""
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("нужен PyYAML: pip install pyyaml", file=sys.stderr)
+    sys.exit(2)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+WS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SUBST_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+errors = {}
+
+
+def err(path, msg):
+    errors.setdefault(path, []).append(msg)
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        err(path, f"не читается: {e}")
+        return None
+
+
+def check_keys(path, data, schema, prefix=""):
+    """schema: {поле: (обязательно, проверка)}"""
+    if not isinstance(data, dict):
+        err(path, f"{prefix or 'корень'}: ожидался словарь")
+        return
+    for k in data:
+        if k not in schema:
+            err(path, f"{prefix}{k}: поля нет в схеме")
+    for k, (required, check) in schema.items():
+        if k not in data:
+            if required:
+                err(path, f"{prefix}{k}: обязательное поле отсутствует")
+            continue
+        msg = check(data[k])
+        if msg:
+            err(path, f"{prefix}{k}: {msg}")
+
+
+def is_str(v):
+    return None if isinstance(v, str) and v.strip() else "ожидалась непустая строка"
+
+
+def is_str_or_null(v):
+    return None if v is None or (isinstance(v, str) and v.strip()) else "ожидалась строка или null"
+
+
+def is_bool(v):
+    return None if isinstance(v, bool) else "ожидалось true или false"
+
+
+def is_bool_or_null(v):
+    return None if v is None or isinstance(v, bool) else "ожидалось true, false или null"
+
+
+def is_tri(v):
+    return None if v is True or v is False or v == "ask" else "ожидалось true, ask или false"
+
+
+def is_enum(*vals):
+    return lambda v: None if v in vals else f"ожидалось одно из {', '.join(vals)}"
+
+
+def any_ok(v):
+    return None
+
+
+class Env:
+    def __init__(self):
+        self.path = os.path.join(ROOT, "env.yaml")
+        self.vars = {"ROOT": ROOT}
+        self.data = None
+
+    def check(self):
+        if not os.path.isfile(self.path):
+            err(self.path, "файла нет: создай по templates/env.yaml")
+            return False
+        d = load(self.path)
+        if d is None:
+            return False
+        self.data = d
+        check_keys(self.path, d, {
+            "tmp_dir": (True, is_str),
+            "secrets_file": (True, is_str),
+            "proxy": (True, any_ok),
+            "vars": (True, any_ok),
+        })
+        if isinstance(d.get("proxy"), dict):
+            check_keys(self.path, d["proxy"], {"dir": (True, is_str_or_null), "url": (True, is_str_or_null)}, "proxy.")
+            if (d["proxy"].get("dir") is None) != (d["proxy"].get("url") is None):
+                err(self.path, "proxy.dir и proxy.url должны быть оба null или оба заданы")
+        else:
+            err(self.path, "proxy: ожидался словарь")
+        if isinstance(d.get("vars"), dict):
+            for k, v in d["vars"].items():
+                if not KEY_RE.match(str(k)):
+                    err(self.path, f"vars.{k}: имя должно быть [A-Z][A-Z0-9_]*")
+                if not isinstance(v, str):
+                    err(self.path, f"vars.{k}: ожидалась строка")
+                else:
+                    self.vars[k] = v
+        else:
+            err(self.path, "vars: ожидался словарь (может быть пустым {})")
+        if isinstance(d.get("tmp_dir"), str):
+            self.vars["TMP_DIR"] = d["tmp_dir"]
+        if isinstance(d.get("secrets_file"), str):
+            self.vars["SECRETS_FILE"] = d["secrets_file"]
+        if isinstance(d.get("proxy"), dict):
+            self.vars["PROXY_DIR"] = d["proxy"].get("dir") or ""
+            self.vars["PROXY_URL"] = d["proxy"].get("url") or ""
+        # раскрыть подстановки в самих переменных
+        for k in list(self.vars):
+            self.vars[k] = self.expand(self.vars[k], self.path, f"{k}")
+        pd = self.vars.get("PROXY_DIR")
+        if pd and not os.path.isfile(os.path.join(pd, "bin", "envctl")):
+            err(self.path, f"proxy.dir: нет bin/envctl в {pd}")
+        return self.path not in errors
+
+    def expand(self, s, path, field):
+        if not isinstance(s, str):
+            return s
+
+        def rep(m):
+            name = m.group(1)
+            if name not in self.vars:
+                err(path, f"{field}: неизвестная подстановка ${{{name}}}")
+                return m.group(0)
+            return self.vars[name]
+
+        prev = None
+        while prev != s:
+            prev, s = s, SUBST_RE.sub(rep, s)
+        return s
+
+
+def check_secrets(env):
+    path = env.expand(env.data.get("secrets_file", ""), env.path, "secrets_file")
+    if not os.path.isfile(path):
+        err(path, "файла нет: создай по templates/secrets.yaml")
+        return path, {}
+    d = load(path)
+    if d is None:
+        return path, {}
+    if not isinstance(d, dict):
+        err(path, "ожидался плоский словарь")
+        return path, {}
+    for k, v in d.items():
+        if not KEY_RE.match(str(k)):
+            err(path, f"{k}: имя должно быть [A-Z][A-Z0-9_]*")
+        if not isinstance(v, str):
+            err(path, f"{k}: ожидалась строка")
+        elif not v.strip():
+            err(path, f"{k}: не заполнено")
+    return path, d
+
+
+def check_ws(env, secrets, ws_dir):
+    path = os.path.join(ws_dir, "ws.yaml")
+    name = os.path.basename(ws_dir)
+    if not os.path.isfile(path):
+        err(ws_dir, "папка без ws.yaml, не пространство")
+        return
+    d = load(path)
+    if d is None:
+        return
+    check_keys(path, d, {
+        "name": (True, is_str),
+        "description": (True, lambda v: None if isinstance(v, str) else "ожидалась строка"),
+        "sources": (True, lambda v: None if isinstance(v, list) and v else "ожидался непустой список"),
+        "git": (True, any_ok),
+        "rules": (True, lambda v: None if isinstance(v, list) else "ожидался список (может быть [])"),
+        "secrets": (True, lambda v: None if isinstance(v, dict) else "ожидался словарь (может быть {})"),
+        "stands": (False, any_ok),
+    })
+    if d.get("name") != name:
+        err(path, f"name: '{d.get('name')}' не совпадает с именем папки '{name}'")
+    if isinstance(d.get("name"), str) and not WS_RE.match(d["name"]):
+        err(path, "name: только a-z, 0-9, -")
+    if d.get("name") == "template":
+        err(path, "name: осталась заглушка из шаблона")
+    if isinstance(d.get("sources"), list):
+        for i, s in enumerate(d["sources"]):
+            p = f"sources[{i}]."
+            check_keys(path, s, {
+                "path": (True, is_str),
+                "kind": (True, is_enum("repo", "repos-dir")),
+                "access": (True, is_enum("write", "ask", "read")),
+            }, p)
+            if isinstance(s, dict) and isinstance(s.get("path"), str):
+                real = env.expand(s["path"], path, p + "path")
+                if "path/to" in real:
+                    err(path, f"{p}path: осталась заглушка из шаблона")
+                elif not os.path.isdir(real):
+                    err(path, f"{p}path: папки нет: {real}")
+                elif s.get("kind") == "repo" and not os.path.exists(os.path.join(real, ".git")):
+                    err(path, f"{p}path: kind: repo, но нет .git в {real}")
+    if isinstance(d.get("git"), dict):
+        check_keys(path, d["git"], {
+            "submodules": (True, is_bool),
+            "root_branch": (True, is_bool),
+            "jira_in_commit": (True, is_bool),
+        }, "git.")
+    else:
+        err(path, "git: ожидался словарь")
+    if isinstance(d.get("rules"), list):
+        for r in d["rules"]:
+            if not isinstance(r, str):
+                err(path, f"rules: элемент {r!r} не строка")
+            elif not os.path.isfile(os.path.join(ws_dir, r)):
+                err(path, f"rules: файла нет: {r}")
+    if isinstance(d.get("secrets"), dict):
+        for svc, key in d["secrets"].items():
+            if not isinstance(key, str) or not KEY_RE.match(key):
+                err(path, f"secrets.{svc}: ключ должен быть [A-Z][A-Z0-9_]*")
+            elif secrets and key not in secrets:
+                err(path, f"secrets.{svc}: ключа {key} нет в файле секретов")
+    if "stands" in d:
+        if isinstance(d["stands"], dict):
+            check_keys(path, d["stands"], {"proxy": (True, is_bool), "landing": (True, is_str_or_null)}, "stands.")
+            if d["stands"].get("proxy") is True and not env.vars.get("PROXY_DIR"):
+                err(path, "stands.proxy: true, но в env.yaml proxy.dir = null")
+        else:
+            err(path, "stands: ожидался словарь")
+    for entry in os.listdir(ws_dir):
+        full = os.path.join(ws_dir, entry)
+        if os.path.isdir(full) and entry not in ("rules", "tasks", "_archive"):
+            err(path, f"лишняя папка в корне пространства: {entry}")
+    for sub in ("tasks", "_archive"):
+        sd = os.path.join(ws_dir, sub)
+        if not os.path.isdir(sd):
+            continue
+        for t in sorted(os.listdir(sd)):
+            td = os.path.join(sd, t)
+            if os.path.isdir(td):
+                check_task(td)
+
+
+def check_task(td):
+    path = os.path.join(td, "task.yaml")
+    if not os.path.isfile(path):
+        err(td, "папка без task.yaml, не задача")
+        return
+    d = load(path)
+    if d is None:
+        return
+    check_keys(path, d, {
+        "issue": (True, is_str),
+        "jira": (True, is_str_or_null),
+        "stage": (True, is_enum("research", "plan", "implement")),
+        "journal": (True, is_bool),
+        "git": (True, any_ok),
+    })
+    if isinstance(d.get("issue"), str) and not os.path.isfile(os.path.join(td, d["issue"])):
+        err(path, f"issue: файла нет: {d['issue']}")
+    if isinstance(d.get("git"), dict):
+        check_keys(path, d["git"], {
+            "base_branch": (True, is_str),
+            "branch": (True, is_str_or_null),
+            "root_branch": (True, is_bool_or_null),
+            "commit": (True, is_tri),
+            "push": (True, is_tri),
+            "merge_request_title": (True, is_str_or_null),
+        }, "git.")
+        if d.get("stage") == "implement" and d["git"].get("branch") is None:
+            err(path, "git.branch: для stage: implement ветка обязательна")
+        for k in ("branch", "merge_request_title"):
+            v = d["git"].get(k)
+            if isinstance(v, str) and v.startswith("<"):
+                err(path, f"git.{k}: осталась заглушка")
+    else:
+        err(path, "git: ожидался словарь")
+
+
+def main():
+    only = sys.argv[1] if len(sys.argv) > 1 else None
+    env = Env()
+    checked = [env.path]
+    secrets = {}
+    if env.check() or env.data is not None:
+        spath, secrets = check_secrets(env)
+        checked.append(spath)
+    wsroot = os.path.join(ROOT, "workspaces")
+    names = [only] if only else sorted(os.listdir(wsroot)) if os.path.isdir(wsroot) else []
+    for n in names:
+        wd = os.path.join(wsroot, n)
+        if not os.path.isdir(wd):
+            if only:
+                err(wd, "пространства нет")
+            continue
+        check_ws(env, secrets, wd)
+        checked.append(os.path.join(wd, "ws.yaml"))
+        for sub in ("tasks", "_archive"):
+            sd = os.path.join(wd, sub)
+            if os.path.isdir(sd):
+                checked += [os.path.join(sd, t, "task.yaml") for t in sorted(os.listdir(sd)) if os.path.isdir(os.path.join(sd, t))]
+    bad = 0
+    for p in checked:
+        rel = os.path.relpath(p, ROOT)
+        if p in errors:
+            bad += 1
+            print(f"{rel}: ОШИБКА")
+            for m in errors[p]:
+                print(f"  - {m}")
+        else:
+            print(f"{rel}: ок")
+    for p in errors:
+        if p not in checked:
+            bad += 1
+            print(f"{os.path.relpath(p, ROOT)}: ОШИБКА")
+            for m in errors[p]:
+                print(f"  - {m}")
+    print(f"\nпроверено {len(checked)}, с ошибками {bad}")
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
