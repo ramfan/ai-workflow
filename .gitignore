@@ -9,6 +9,9 @@
 # Учёт ведётся локально
 /registry/WORKTREES.md
 
+# Настройки прокси этой машины (пример: conf/settings.local.example.json)
+/infra/nginx-env/conf/settings.local.json
+
 # Генерируемые файлы прокси
 /infra/nginx-env/var/
 /infra/nginx-env/stands.d/*

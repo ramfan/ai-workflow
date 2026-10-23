@@ -121,7 +121,7 @@ workspaces/<ws>/
 ## Ограничения
 
 - Репозиторий не управляет вашим кодом: он задаёт процесс работы агента с ним.
-- Секреты и настройки машины (`env.yaml`, `secrets.yaml`, `workspaces/*`) не коммитятся.
+- Секреты и настройки машины (`env.yaml`, `secrets.yaml`, `workspaces/*`, `registry/`, `infra/nginx-env/conf/settings.local.json`) не коммитятся.
 - Автоматический запуск хуков включается только строками в `hooks/TRIGGERS.md`.
 
 ## Лицензия

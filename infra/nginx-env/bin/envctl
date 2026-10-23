@@ -52,9 +52,21 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
 
 def load_settings():
+    """conf/settings.json — общие значения (в git); conf/settings.local.json — значения этой машины
+    (не коммитится), его ключи заменяют одноимённые ключи общего файла."""
     global WRAPPER_MARKERS, RESERVED_NAMES, PROTECTED_MARKERS
     with open(os.path.join(CONF, "settings.json"), encoding="utf-8") as f:
         settings = json.load(f)
+    local = os.path.join(CONF, "settings.local.json")
+    if os.path.exists(local):
+        try:
+            with open(local, encoding="utf-8") as f:
+                override = json.load(f)
+        except ValueError as e:
+            die(f"conf/settings.local.json: неверный JSON: {e}")
+        if not isinstance(override, dict):
+            die("conf/settings.local.json: ожидался объект")
+        settings.update(override)
     WRAPPER_MARKERS = tuple(settings.get("wrapper_markers", []))
     RESERVED_NAMES = tuple(settings.get("reserved_names", []))
     PROTECTED_MARKERS = PROTECTED_MARKERS + tuple(settings.get("protected_markers", []))
@@ -752,7 +764,6 @@ def cmd_free_port(args, settings):
 
 
 def main():
-    settings = load_settings()
     ap = argparse.ArgumentParser(prog="envctl", description="nginx-прокси для стендов и панель")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("up", help="скачать nginx при необходимости, сгенерировать конфиг, запустить или перечитать")
@@ -780,6 +791,7 @@ def main():
     sub.add_parser("api", help="сервис команд панели на переднем плане (обычно запускает envctl up)")
     args = ap.parse_args()
     try:
+        settings = load_settings()
         {
             "up": cmd_up, "down": cmd_down, "reload": cmd_reload, "status": cmd_status,
             "add": cmd_add, "rm": cmd_rm, "stop": cmd_stop, "free-port": cmd_free_port,

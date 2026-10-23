@@ -1,0 +1,7 @@
+{
+  "listen_port": 10002,
+  "direct_ports": [],
+  "wrapper_markers": ["my-dev-server-wrapper"],
+  "reserved_names": ["app"],
+  "protected_markers": []
+}
