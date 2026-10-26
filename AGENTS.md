@@ -182,6 +182,7 @@
 | `rules/merge-requests.md` | Оформление merge request |
 | `rules/stands-proxy.md` | Стенды: порты, прокси, учётные данные |
 | `rules/human-readable-texts.md` | Тексты, которые читает человек |
+| `rules/task-documents.md` | Документы задачи: вопросы в `questions.md`, план в `plan.md` |
 
 ---
 
