@@ -73,19 +73,6 @@ http {
 
         include @ROUTES@;
 
-        # Монитор ресурсов контейнера (RAM/CPU по процессам + kill).
-        # Отдельный сервис personal-persistent/services/infra/resmon, слушает только
-        # loopback; его порт — единственный владелец RESMON_PORT в <resmon>/.env.
-        # Здесь путь монтируется, чтобы не занимать внешний порт вторым листенером.
-        # proxy_buffering off (см. http {}) обязателен: у монитора SSE-поток.
-        location = /resmon { return 302 /resmon/; }
-        location ^~ /resmon/ {
-            include @CONF@/proxy_headers.conf;
-            proxy_connect_timeout 2s;
-            proxy_read_timeout 1h;
-            proxy_pass http://127.0.0.1:10099/;
-        }
-
         # Общего catch-all нет: у каждого стенда свой префикс.
         location / {
             default_type text/html;
