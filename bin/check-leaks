@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Проверка, что в git ai-workflow не попадает конкретика пространств и машины.
+
+Использование: bin/check-leaks [--history] [--term <слово>]... [--allow <слово>]...
+
+Список запрещённых терминов собирается из локальных данных, которые не коммитятся:
+имена пространств и задач, репозитории источников и хосты их remote, пути и свои
+переменные из env.yaml, значения секретов. Проверяются файлы, которые попадут
+в коммит (отслеживаемые и неигнорируемые новые). С --history — ещё вся история git.
+--term добавляет термин, --allow убирает ложную находку (общее слово).
+
+Ничего не меняет. Значения секретов не выводит — только имена ключей.
+Код выхода: 0 — находок нет, 1 — есть находки, 2 — ошибка запуска.
+"""
+import os
+import re
+import subprocess
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("нужен PyYAML: pip install pyyaml", file=sys.stderr)
+    sys.exit(2)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SUBST_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+TASK_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)-\d+$")
+MIN_LEN = 4
+MAX_REPO_DEPTH = 4
+
+# Общие слова, которые сами по себе не выдают проект.
+GENERIC = {
+    "frontend", "backend", "front", "back", "prototypes", "prototype", "proto",
+    "services", "service", "code", "tasks", "task", "apps", "core", "common",
+    "libs", "packages", "package", "main", "master", "develop", "release",
+    "test", "tests", "docs", "server", "client", "home", "data", "path", "repo",
+    "repos", "module", "modules", "tools", "utils", "shared", "plugin", "plugins",
+    "gitlab", "github", "corp", "local", "localhost", "workspace", "workspaces",
+    "persistent", "personal", "project", "projects", "work", "files", "build",
+    "dist", "bin", "temp", "opencode",
+}
+
+terms = {}  # нижний регистр -> (как показывать, откуда, секрет)
+
+
+def add(term, origin, secret=False):
+    if not isinstance(term, str):
+        return
+    term = term.strip()
+    if len(term) < MIN_LEN:
+        return
+    key = term.lower()
+    if not secret and key in GENERIC:
+        return
+    if key not in terms or secret:
+        terms[key] = (term, origin, secret)
+
+
+def add_tokens(name, origin):
+    add(name, origin)
+    for tok in re.split(r"[-_.\s/]+", name):
+        add(tok, origin)
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def strings(data):
+    if isinstance(data, str):
+        yield data
+    elif isinstance(data, dict):
+        for v in data.values():
+            yield from strings(v)
+    elif isinstance(data, list):
+        for v in data:
+            yield from strings(v)
+
+
+# --- env.yaml и подстановки ---
+
+env = load(os.path.join(ROOT, "env.yaml")) or {}
+tpl_env = load(os.path.join(ROOT, "templates", "env.yaml")) or {}
+ctx = {"ROOT": ROOT}
+ctx["TMP_DIR"] = env.get("tmp_dir") or ""
+ctx["SECRETS_FILE"] = env.get("secrets_file") or ""
+proxy = env.get("proxy") or {}
+ctx["PROXY_DIR"] = proxy.get("dir") or ""
+ctx["PROXY_URL"] = proxy.get("url") or ""
+env_vars = env.get("vars") or {}
+ctx.update({k: v for k, v in env_vars.items() if isinstance(v, str)})
+
+
+def expand(s, depth=0):
+    if not isinstance(s, str) or depth > 5:
+        return s
+    out = SUBST_RE.sub(lambda m: str(ctx.get(m.group(1), m.group(0))), s)
+    return expand(out, depth + 1) if out != s else out
+
+
+for k in list(ctx):
+    ctx[k] = expand(ctx[k])
+
+tpl_values = {expand(v) for v in strings(tpl_env)}
+tpl_vars = set((tpl_env.get("vars") or {}).keys())
+
+for name, value in env_vars.items():
+    if name not in tpl_vars:
+        add(name, "env.yaml → vars (своя переменная)")
+    value = expand(value)
+    if isinstance(value, str) and value not in tpl_values:
+        add(value, f"env.yaml → vars.{name}")
+        add(os.path.basename(value.rstrip("/")), f"env.yaml → vars.{name}")
+
+for value in strings({k: v for k, v in env.items() if k != "vars"}):
+    value = expand(value)
+    if value not in tpl_values and not value.startswith(ROOT):
+        add(value, "env.yaml")
+
+add(ROOT, "путь $ROOT этой машины")
+home = os.path.expanduser("~")
+if home not in ("/", "/root"):
+    add(home, "домашняя папка этой машины")
+
+# --- секреты ---
+
+secrets_path = expand(env.get("secrets_file") or os.path.join(ROOT, "secrets.yaml"))
+secrets = load(secrets_path) or {}
+if isinstance(secrets, dict):
+    for k, v in secrets.items():
+        if isinstance(v, str) and len(v) >= 6:
+            add(v, f"значение секрета {k}", secret=True)
+
+# --- пространства, задачи, источники ---
+
+
+def find_repos(path, depth=0):
+    if not os.path.isdir(path):
+        return
+    if os.path.exists(os.path.join(path, ".git")):
+        yield path
+        return
+    if depth >= MAX_REPO_DEPTH:
+        return
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: e.name)
+    except OSError:
+        return
+    for e in entries:
+        if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name != "node_modules":
+            yield from find_repos(e.path, depth + 1)
+
+
+def remote_hosts(repo):
+    try:
+        out = subprocess.run(["git", "-C", repo, "remote", "-v"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    for url in set(line.split()[1] for line in out.splitlines() if len(line.split()) > 1):
+        m = re.match(r"^(?:[a-z+]+://)?(?:[^@/]+@)?([^:/]+)[:/](.*?)(?:\.git)?$", url)
+        if not m:
+            continue
+        host, rest = m.groups()
+        yield host, rest
+
+
+ws_dir = os.path.join(ROOT, "workspaces")
+seen_repos = set()
+for ws in sorted(os.listdir(ws_dir)) if os.path.isdir(ws_dir) else []:
+    wpath = os.path.join(ws_dir, ws)
+    if ws.startswith(".") or not os.path.isdir(wpath):
+        continue
+    add_tokens(ws, f"имя пространства {ws}")
+    for sub in ("tasks", "_archive"):
+        for task in sorted(os.listdir(os.path.join(wpath, sub))) if os.path.isdir(os.path.join(wpath, sub)) else []:
+            if task.startswith("."):
+                continue
+            add(task, f"задача {ws}/{task}")
+            m = TASK_KEY_RE.match(task)
+            if m:
+                add(m.group(1), f"ключ задач {ws}/{task}")
+    wsy = load(os.path.join(wpath, "ws.yaml")) or {}
+    for src in wsy.get("sources") or []:
+        spath = expand((src or {}).get("path"))
+        if not isinstance(spath, str):
+            continue
+        add(spath, f"источник {ws}")
+        add(os.path.basename(spath.rstrip("/")), f"источник {ws}")
+        for repo in find_repos(spath):
+            if repo in seen_repos:
+                continue
+            seen_repos.add(repo)
+            add(os.path.basename(repo), f"репозиторий {repo}")
+            for host, rest in remote_hosts(repo):
+                add(host, f"remote {repo}")
+                labels = host.split(".")
+                for label in labels[:-1]:
+                    add(label, f"remote {repo}")
+                for part in rest.split("/"):
+                    add(part, f"remote {repo}")
+
+args = sys.argv[1:]
+history = False
+allow = []
+i = 0
+while i < len(args):
+    if args[i] == "--history":
+        history = True
+    elif args[i] == "--term" and i + 1 < len(args):
+        i += 1
+        add(args[i], "аргумент --term")
+    elif args[i] == "--allow" and i + 1 < len(args):
+        i += 1
+        allow.append(args[i].lower())
+    else:
+        print(f"неизвестный аргумент: {args[i]}\n{__doc__}", file=sys.stderr)
+        sys.exit(2)
+    i += 1
+
+for a in allow:
+    if a in terms and not terms[a][2]:
+        del terms[a]
+
+if not terms:
+    print("терминов для проверки нет: нет env.yaml, пространств и секретов")
+    sys.exit(0)
+
+# --- поиск ---
+
+plain = [(k, v) for k, v in terms.items() if not v[2]]
+plain.sort(key=lambda kv: -len(kv[0]))
+word_re = re.compile(
+    r"(?<![A-Za-z0-9])(" + "|".join(re.escape(k) for k, _ in plain) + r")(?![A-Za-z0-9])",
+    re.IGNORECASE) if plain else None
+secret_terms = [(v[0], v[1]) for v in terms.values() if v[2]]
+
+
+def scan_line(line):
+    """Возвращает список (термин, откуда, секрет) без повторов."""
+    found = []
+    for value, origin in secret_terms:
+        if value in line:
+            found.append((None, origin, True))
+    if word_re:
+        for m in word_re.finditer(line):
+            t = terms[m.group(1).lower()]
+            if (t[0], t[1], False) not in found:
+                found.append((t[0], t[1], False))
+    return found
+
+
+def git(*cmd):
+    return subprocess.run(["git", "-C", ROOT, *cmd], capture_output=True, text=True,
+                          errors="replace", check=True).stdout
+
+
+def show(line):
+    line = line.strip()
+    return line if len(line) <= 140 else line[:137] + "..."
+
+
+findings = 0
+files = [f for f in git("ls-files", "-co", "--exclude-standard", "-z").split("\0") if f]
+print("Рабочая копия (что попадёт в коммит):")
+for rel in files:
+    path = os.path.join(ROOT, rel)
+    if not os.path.isfile(path):
+        continue
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        continue
+    if b"\0" in raw:
+        continue
+    for no, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+        hits = scan_line(line)
+        for term, origin, secret in hits:
+            findings += 1
+            if secret:
+                print(f"  {rel}:{no}: {origin}")
+            else:
+                print(f"  {rel}:{no}: «{term}» ({origin}): {show(line)}")
+if not findings:
+    print("  находок нет")
+
+if history:
+    print("\nИстория git (все ветки, сообщения коммитов и изменённые строки):")
+    hist = 0
+    seen = set()
+    commit, fname = "", ""
+    log = git("log", "--all", "-p", "--no-color", "--format=commit %H%n%B")
+    for line in log.splitlines():
+        if line.startswith("commit ") and len(line) == 47:
+            commit, fname = line[7:15], "(сообщение коммита)"
+            continue
+        if line.startswith("diff --git "):
+            fname = line.split(" b/", 1)[-1]
+            continue
+        if line.startswith(("+++", "---", "@@", "index ")):
+            continue
+        if fname != "(сообщение коммита)" and not line.startswith(("+", "-")):
+            continue
+        for term, origin, secret in scan_line(line):
+            key = (commit, fname, term or origin)
+            if key in seen:
+                continue
+            seen.add(key)
+            hist += 1
+            label = origin if secret else f"«{term}» ({origin})"
+            print(f"  {commit} {fname}: {label}")
+    if not hist:
+        print("  находок нет")
+    findings += hist
+
+print(f"\nтерминов проверено {len(terms)}, находок {findings}")
+sys.exit(1 if findings else 0)

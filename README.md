@@ -85,6 +85,7 @@ rules/               общие правила: схемы YAML, worktree, жу�
 templates/           шаблоны env.yaml, secrets.yaml, ws.yaml, task.yaml и др.
 hooks/               хуки hook:<имя> и реестр автозапуска TRIGGERS.md
 bin/check-config     проверка всех YAML по схемам
+bin/check-leaks      проверка, что в git нет конкретики пространств и машины
 registry/            учёт worktree (локальный)
 infra/nginx-env/     прокси стендов: nginx + панель + envctl
 workspaces/<ws>/
@@ -101,6 +102,7 @@ workspaces/<ws>/
 - Статусы worktree видны в `registry/WORKTREES.md`.
 - Хуки запускаются вручную (`hook:<имя>`) или автоматически по событиям из `hooks/TRIGGERS.md`.
 - Проверить все настройки можно в любой момент: `bin/check-config [<ws>]`.
+- Перед коммитом в этот репозиторий проверьте, что в него не попадает конкретика проектов: `bin/check-leaks` или `hook:check-leaks`.
 
 ## Стенды
 
@@ -114,7 +116,7 @@ workspaces/<ws>/
 
 ## Требования
 
-- Python 3 и PyYAML — для `bin/check-config` и `envctl`.
+- Python 3 и PyYAML — для `bin/check-config`, `bin/check-leaks` и `envctl`.
 - Git — для worktree и задач.
 - nginx скачивается автоматически при первом `envctl up`; устанавливать его в систему не нужно.
 
