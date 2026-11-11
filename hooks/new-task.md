@@ -27,4 +27,4 @@
 
 ## Результат
 
-Сообщи пути к `task.yaml` и `task.md` и напомни, что перед началом работы нужно заполнить раздел «Задача» в `task.md` и поля `stage`, `git.base_branch`, `git.branch`, `git.commit`, `git.push`, `git.merge_request_title` в `task.yaml`.
+Сообщи пути к `task.yaml` и `task.md` и напомни, что перед началом работы нужно заполнить раздел «Задача» в `task.md` и поля `stage`, `git.base_branch`, `git.branch`, `git.commit`, `git.push`, `git.merge_request_title` в `task.yaml`. Файл `.context.md` хук не создаёт: его собирает `hook:context-task` при первом запуске задачи.
